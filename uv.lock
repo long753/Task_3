@@ -1967,6 +1967,7 @@ dependencies = [
     { name = "openai" },
     { name = "opencv-python" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "ultralytics" },
 ]
 
@@ -1976,6 +1977,7 @@ requires-dist = [
     { name = "openai", specifier = ">=3.37.0" },
     { name = "opencv-python", specifier = ">=5.0.0.93" },
     { name = "python-dotenv", specifier = ">=1.2.4" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "ultralytics", specifier = ">=8.4.189" },
 ]
 

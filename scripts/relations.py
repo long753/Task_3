@@ -11,35 +11,37 @@ from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 
-RELATIONS = {
-    "left_of": "主体的框中心在客体框中心左侧，按画面坐标判断",
-    "right_of": "主体的框中心在客体框中心右侧，按画面坐标判断",
-    "on": "主体放在客体表面并由客体支撑，仅仅处于上方不算",
-    "holding": "主体通过手部抓握或托持客体，仅靠近不算",
-}
+import yaml
+
 STATUSES = {"yes", "no", "unknown"}
+
+
+def load_config(path):
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config", type=Path,
+        default=Path(__file__).resolve().parents[1] / "config" / "relations.yaml",
+        help="关系定义与提示词 YAML；默认使用项目 config/relations.yaml",
+    )
     parser.add_argument("--detections", type=Path, required=True,
                         help="detect.py 生成的 *_objects.json")
     parser.add_argument("--pair", nargs=2, type=int, action="append", required=True,
                         metavar=("SUBJECT_ID", "OBJECT_ID"),
                         help="指定有方向的对象对；可以重复此参数")
-    parser.add_argument("--relations", nargs="+", choices=RELATIONS,
-                        default=["left_of", "right_of", "on", "holding"])
+    parser.add_argument("--relations", nargs="+",
+                        help="要判断的关系名称；省略时使用配置中的全部关系")
     parser.add_argument("--output", type=Path, default=Path("outputs/relations"))
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--model", default=None, help="覆盖 .env 中的 QWEN_MODEL")
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--dry-run", action="store_true",
-                        help="只检查输入、生成提示词，不调用 API")
-    args = parser.parse_args()
-    if args.max_tokens <= 0 or args.timeout <= 0:
-        parser.error("--max-tokens 和 --timeout 必须为正数")
-    return args
+                        help="只生成配置快照和提示词，不调用 API")
+    return parser.parse_args()
 
 
 def write_json(path, value):
@@ -47,19 +49,114 @@ def write_json(path, value):
                                allow_nan=False), encoding="utf-8")
 
 
-def load_scene(path, pairs, relation_types):
-    scene = json.loads(path.read_text(encoding="utf-8"))
-    objects = scene.get("objects")
-    if not isinstance(objects, list):
-        raise ValueError("检测 JSON 必须包含 objects 列表")
-    if not all(isinstance(obj, dict) and type(obj.get("object_id")) is int
-               for obj in objects):
-        raise ValueError("每个对象必须包含整数 object_id")
+def build_prompt(objects, queries, config):
+    definitions = {q["predicate"]: config["relations"][q["predicate"]] for q in queries}
+    indexed_queries = {
+        f"q{i}": query for i, query in enumerate(queries, start=1)
+    }
+    template = {"relations": {
+        key: {"status": "", "reason": ""} for key in indexed_queries
+    }}
+    return "\n".join([
+        config["prompt"]["task"].strip(),
+        config["prompt"]["guidelines"].strip(),
+        "不得增加对象或更改 ID。",
+        f"queries 共 {len(queries)} 项，按查询编号逐项填写 status 和 reason，不得省略。",
+        "查询编号必须原样保留；无法判断也要填写 unknown，不需要返回对象 ID 或关系名称。",
+        "根据 queries 中 subject_id → object_id 的方向判断，不能颠倒主体与客体。",
+        "关系定义：" + json.dumps(definitions, ensure_ascii=False),
+        "status 只能为 " + "、".join(sorted(STATUSES)) + "。",
+        "只输出 JSON 对象，顶层只有 relations 映射，不要 Markdown 代码块。",
+        "relations 的键是查询编号，每个值只包含 status 和一句中文 reason。",
+        "对象列表：" + json.dumps(objects, ensure_ascii=False),
+        "queries：" + json.dumps(indexed_queries, ensure_ascii=False),
+        "请填写以下 JSON 模板：" + json.dumps(template, ensure_ascii=False),
+    ])
+
+
+def image_data_url(path):
+    mime = mimetypes.guess_type(path.name)[0]
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def validate_response(text, queries):
+    answers = json.loads(text)["relations"]
+    keys = [f"q{i}" for i in range(1, len(queries) + 1)]
+    if set(answers) != set(keys):
+        raise ValueError("模型返回的查询编号与请求不一致")
+    relations = []
+    for key, query in zip(keys, queries):
+        answer = answers[key]
+        if answer["status"] not in STATUSES:
+            raise ValueError("status 必须为 yes / no / unknown")
+        relations.append({
+            **query, "status": answer["status"], "reason": answer["reason"],
+        })
+    return relations
+
+
+def request_relations(client, model, prompt, image_content, queries,
+                      max_tokens=2048, *, output=None):
+    """发送一次视觉查询；仅独立关系脚本需要保存原始响应。"""
+    start = perf_counter()
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": prompt}, *image_content,
+        ]}],
+        response_format={"type": "json_object"},
+        extra_body={"enable_thinking": False},
+        temperature=0,
+        max_tokens=max_tokens,
+    )
+    elapsed_ms = round((perf_counter() - start) * 1000, 2)
+    if output is not None:
+        write_json(output / "raw_response.json", response.model_dump(mode="json"))
+    choice = response.choices[0]
+    if choice.finish_reason != "stop":
+        raise ValueError(f"响应未正常完成：{choice.finish_reason}")
+    text = choice.message.content
+    if output is not None:
+        (output / "raw_content.txt").write_text(text, encoding="utf-8")
+    return {
+        "model_requested": model,
+        "model_returned": response.model,
+        "elapsed_ms": elapsed_ms,
+        "usage": response.usage.model_dump(mode="json") if response.usage else None,
+        "relations": validate_response(text, queries),
+    }
+
+
+def save_relations(output, data):
+    write_json(output / "relations.json", data)
+    with (output / "relations.csv").open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "subject_id", "predicate", "object_id", "status", "reason"])
+        writer.writeheader()
+        writer.writerows(data["relations"])
+
+
+def main():
+    # 1. 读取参数、实验配置和检测结果。
+    args = parse_args()
+    config_path = args.config.expanduser().resolve()
+    config = load_config(config_path)
+    relation_types = args.relations or list(config["relations"])
+    if not args.dry_run:
+        from dotenv import load_dotenv
+        load_dotenv(args.env_file.expanduser(), override=False)
+    model = args.model or os.getenv("QWEN_MODEL")
+    base_url = (os.getenv("QWEN_BASE_URL")
+                or "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    detections = args.detections.expanduser().resolve()
+    scene = json.loads(detections.read_text(encoding="utf-8"))
+    objects = scene["objects"]
+
+    # 2. 将对象对和关系名称组合成查询。
     ids = [obj["object_id"] for obj in objects]
-    if len(ids) != len(set(ids)):
-        raise ValueError("检测结果中 object_id 重复")
     queries = []
-    for subject_id, object_id in pairs:
+    for subject_id, object_id in args.pair:
         if subject_id == object_id or subject_id not in ids or object_id not in ids:
             raise ValueError(f"无效对象对 {subject_id}, {object_id}；可用 ID：{ids}")
         for predicate in relation_types:
@@ -67,92 +164,28 @@ def load_scene(path, pairs, relation_types):
                      "object_id": object_id}
             if query not in queries:
                 queries.append(query)
+
+    # 检测 JSON 中的相对图片路径以该 JSON 所在目录为基准。
     images = []
-    for field in ["original_image", "annotated_image"]:
+    for field in ("original_image", "annotated_image"):
         image = Path(scene[field]).expanduser()
         if not image.is_absolute():
-            image = path.parent / image
-        image = image.resolve()
-        if not image.is_file():
-            raise FileNotFoundError(f"找不到图片：{image}")
-        images.append(image)
-    return objects, queries, images
+            image = detections.parent / image
+        images.append(image.resolve())
+    prompt = build_prompt(objects, queries, config)
 
-
-def build_prompt(objects, queries):
-    definitions = {q["predicate"]: RELATIONS[q["predicate"]] for q in queries}
-    return (
-        "你正在进行机器人场景关系判断。第一张是原图，第二张是同一画面的编号图。\n"
-        "编号图只用于定位对象，结合原图判断关系。对象名称可能有检测错误；"
-        "如果无法对应到实际物体，请返回 unknown。不得增加对象或更改 ID。\n"
-        "只回答指定 queries 中的查询，每个查询恰好返回一次。\n"
-        "关系定义：" + json.dumps(definitions, ensure_ascii=False) + "\n"
-        "status 只能为 yes、no、unknown。只有画面证据明确时才返回 yes 或 no；"
-        "遮挡、无法确认身份或证据不足时返回 unknown。不能仅凭类别常识判断。\n"
-        "reason 用一句简短中文描述可见证据，不推测未观察到的动作。\n"
-        "只输出 JSON 对象，顶层只有 relations 列表，不要 Markdown 代码块。\n"
-        "每一项包含 subject_id（整数）、predicate（字符串）、"
-        "object_id（整数）、status（字符串）、reason（字符串）。\n"
-        "对象列表：" + json.dumps(objects, ensure_ascii=False) + "\n"
-        "queries：" + json.dumps(queries, ensure_ascii=False)
-    )
-
-
-def image_data_url(path):
-    mime = mimetypes.guess_type(path.name)[0]
-    if mime not in {"image/png", "image/jpeg", "image/webp", "image/bmp"}:
-        raise ValueError(f"不支持的图片格式：{path}")
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
-
-
-def validate_response(text, queries):
-    data = json.loads(text)
-    if not isinstance(data, dict) or not isinstance(data.get("relations"), list):
-        raise ValueError("响应必须包含 relations 列表")
-    expected = {(q["subject_id"], q["predicate"], q["object_id"]) for q in queries}
-    found = {}
-    for item in data["relations"]:
-        if not isinstance(item, dict):
-            raise ValueError("relations 中每一项必须为对象")
-        if type(item.get("subject_id")) is not int or type(item.get("object_id")) is not int:
-            raise ValueError("响应中的对象 ID 必须为整数")
-        if not isinstance(item.get("predicate"), str):
-            raise ValueError("predicate 必须为字符串")
-        key = (item["subject_id"], item["predicate"], item["object_id"])
-        if key not in expected or key in found:
-            raise ValueError(f"响应包含未请求或重复的关系：{key}")
-        if not isinstance(item.get("status"), str) or item["status"] not in STATUSES:
-            raise ValueError("status 必须为 yes / no / unknown")
-        if not isinstance(item.get("reason"), str) or not item["reason"].strip():
-            raise ValueError("每项关系必须包含非空 reason")
-        found[key] = {**dict(zip(("subject_id", "predicate", "object_id"), key)),
-                      "status": item["status"], "reason": item["reason"]}
-    if set(found) != expected:
-        raise ValueError("响应缺少部分请求的关系")
-    return [found[(q["subject_id"], q["predicate"], q["object_id"])] for q in queries]
-
-
-def main():
-    args = parse_args()
-    # dry-run 仅依赖标准库，便于先核对输入和提示词。
-    if not args.dry_run:
-        from dotenv import load_dotenv
-        load_dotenv(args.env_file.expanduser(), override=False)
-    model = args.model or os.getenv("QWEN_MODEL") or "qwen3-vl-plus"
-    base_url = (os.getenv("QWEN_BASE_URL")
-                or "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    detections = args.detections.expanduser().resolve()
-    objects, queries, images = load_scene(detections, args.pair, args.relations)
-    prompt = build_prompt(objects, queries)
-
-    # 每次运行使用独立子目录，保留不同参数和失败记录。
+    # 3. 保存本次配置与最终提示词，便于核对模型输入。
     run_name = detections.stem + "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output = args.output.expanduser().resolve() / run_name
     output.mkdir(parents=True, exist_ok=False)
     (output / "prompt.txt").write_text(prompt, encoding="utf-8")
+    (output / "config.yaml").write_text(
+        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
     request = {
         "detections_json": str(detections),
+        "config_path": str(config_path),
         "original_image": str(images[0]),
         "annotated_image": str(images[1]),
         "objects": objects,
@@ -168,68 +201,33 @@ def main():
     write_json(output / "request.json", request)
     print(f"请求 {len(queries)} 项关系；结果目录：{output}", flush=True)
     if args.dry_run:
-        print("输入检查通过；已生成 prompt.txt 和 request.json，未调用 API。")
+        print("已生成配置快照、prompt.txt 和 request.json，未调用 API。")
         return
 
-    api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
-    if not api_key:
-        raise SystemExit("请在项目 .env 中配置 DASHSCOPE_API_KEY")
+    # 4. 把提示词和两张图片一起发送给视觉模型。
+    api_key = os.environ["DASHSCOPE_API_KEY"]
     from openai import OpenAI
-    content = [{"type": "text", "text": prompt}]
-    for image in images:
-        content.append({"type": "image_url",
-                        "image_url": {"url": image_data_url(image)}})
-    client = OpenAI(api_key=api_key, base_url=base_url,
-                    timeout=args.timeout, max_retries=0)
-    start = perf_counter()
-    phase = "api_error"
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": content}],
-            response_format={"type": "json_object"},
-            extra_body={"enable_thinking": False},
-            temperature=0,
-            max_tokens=args.max_tokens,
+    image_content = [
+        {"type": "image_url", "image_url": {"url": image_data_url(image)}}
+        for image in images
+    ]
+    with OpenAI(api_key=api_key, base_url=base_url,
+                timeout=args.timeout, max_retries=0) as client:
+        result = request_relations(
+            client, model, prompt, image_content, queries,
+            max_tokens=args.max_tokens, output=output,
         )
-        elapsed_ms = round((perf_counter() - start) * 1000, 2)
-        write_json(output / "raw_response.json", response.model_dump(mode="json"))
-        phase = "validation_error"
-        choice = response.choices[0]
-        text = choice.message.content or ""
-        (output / "raw_content.txt").write_text(text, encoding="utf-8")
-        if choice.finish_reason != "stop":
-            raise ValueError(f"响应未正常完成：{choice.finish_reason}")
-        relations = validate_response(text, queries)
-    except Exception as exc:
-        write_json(output / "error.json", {
-            "status": phase, "error_type": type(exc).__name__,
-            "message": str(exc),
-            "elapsed_ms": round((perf_counter() - start) * 1000, 2),
-        })
-        raise SystemExit(f"{phase}：{exc}；详情见 {output / 'error.json'}") from None
-    finally:
-        client.close()
 
-    write_json(output / "relations.json", {
+    # 5. 将模型返回的关系保存为 JSON 和 CSV。
+    save_relations(output, {
         "status": "ok",
         "detections_json": str(detections),
         "objects": objects,
-        "model_requested": model,
-        "model_returned": response.model,
-        "elapsed_ms": elapsed_ms,
-        "usage": response.usage.model_dump(mode="json") if response.usage else None,
-        "relations": relations,
+        **result,
     })
-    with (output / "relations.csv").open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "subject_id", "predicate", "object_id", "status", "reason"])
-        writer.writeheader()
-        writer.writerows(relations)
-    print(json.dumps(relations, ensure_ascii=False, indent=2))
+    print(json.dumps(result["relations"], ensure_ascii=False, indent=2))
     print("已保存关系 JSON / CSV、提示词、原始响应和调用耗时。")
 
 
 if __name__ == "__main__":
     main()
-

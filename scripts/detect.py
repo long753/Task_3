@@ -21,10 +21,6 @@ def parse_args():
     parser.add_argument("--output", type=Path, default=Path("outputs/detect"),
                         help="输出目录，相对于运行命令时的目录")
     args = parser.parse_args()
-    if not 0 <= args.conf <= 1 or not 0 <= args.iou <= 1:
-        parser.error("--conf 和 --iou 必须在 0 到 1 之间")
-    if args.imgsz <= 0:
-        parser.error("--imgsz 必须为正整数")
     return args
 
 
@@ -42,28 +38,26 @@ def draw_object(image, obj):
     label_x = max(0, min(x1, width - text_w - 8))
     label_y = min(height - baseline - 4, max(text_h + 4, y1 - 8))
     cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-    # 黑色描边，提升文字在复杂背景上的可读性。
-    for text_color, thickness in [((0, 0, 0), 3), (color, 1)]:
-        cv2.putText(image, label, (label_x, label_y), font, scale,
-                    text_color, thickness, cv2.LINE_AA)
+    # 黑底白字，标签只绘制一次。
+    cv2.rectangle(image, (label_x - 2, label_y - text_h - 3),
+                  (label_x + text_w + 4, label_y + baseline + 2),
+                  (0, 0, 0), cv2.FILLED)
+    cv2.putText(image, label, (label_x, label_y), font, scale,
+                (255, 255, 255), 1, cv2.LINE_AA)
 
 
-def main():
-    args = parse_args()
-    source = args.source.expanduser().resolve()
-    if not source.is_file():
-        raise FileNotFoundError(f"找不到输入图片：{source}")
-
-    # 加载预训练模型，执行推理。
-    model = YOLO(args.model)
+def detect_image(model, source, output, conf=0.25, iou=0.7, imgsz=640,
+                 device=None, filenames=None):
+    """检测并保存图片与对象信息；model 由调用方加载，可供多张图片复用。"""
+    source = Path(source).expanduser().resolve()
     if model.task != "detect":
         raise ValueError("请使用目标检测权重，例如 yolo11n.pt")
     result = model.predict(
         source=str(source),
-        conf=args.conf,
-        iou=args.iou,
-        imgsz=args.imgsz,
-        device=args.device,
+        conf=conf,
+        iou=iou,
+        imgsz=imgsz,
+        device=device,
         save=False,  # 由本脚本显式保存，输出路径不受 runs_dir 设置影响。
     )[0]
 
@@ -85,11 +79,13 @@ def main():
     for obj in objects:
         draw_object(annotated, obj)
 
-    output = args.output.expanduser().resolve()
+    output = Path(output).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    original_path = output / f"{source.stem}_original.png"
-    annotated_path = output / f"{source.stem}_annotated.png"
-    json_path = output / f"{source.stem}_objects.json"
+    if filenames is None:
+        filenames = (f"{source.stem}_original.png",
+                     f"{source.stem}_annotated.png",
+                     f"{source.stem}_objects.json")
+    original_path, annotated_path, json_path = [output / name for name in filenames]
 
     for path, image in [(original_path, original), (annotated_path, annotated)]:
         if not cv2.imwrite(str(path), image):
@@ -103,11 +99,11 @@ def main():
         "image_width": width,
         "image_height": height,
         "bbox_format": "xyxy_pixels",
-        "model": args.model,
+        "model": str(model.ckpt_path),
         "ultralytics_version": ultralytics.__version__,
-        "confidence_threshold": args.conf,
-        "nms_iou_threshold": args.iou,
-        "imgsz": args.imgsz,
+        "confidence_threshold": conf,
+        "nms_iou_threshold": iou,
+        "imgsz": imgsz,
         "speed_ms": result.speed,
         "object_count": len(objects),
         "objects": objects,
@@ -116,10 +112,19 @@ def main():
         json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False),
         encoding="utf-8",
     )
-    print(f"检测到 {len(objects)} 个物体")
-    print(f"原图：{original_path}")
-    print(f"编号图：{annotated_path}")
-    print(f"对象 JSON：{json_path}")
+    return data
+
+
+def main():
+    args = parse_args()
+    model = YOLO(args.model)
+    data = detect_image(model, args.source, args.output,
+                        conf=args.conf, iou=args.iou, imgsz=args.imgsz,
+                        device=args.device)
+    print(f"检测到 {data['object_count']} 个物体")
+    print(f"原图：{data['original_image']}")
+    print(f"编号图：{data['annotated_image']}")
+    print(f"对象 JSON：{Path(args.output).resolve() / (Path(args.source).stem + '_objects.json')}")
 
 
 if __name__ == "__main__":
