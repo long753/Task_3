@@ -1,0 +1,33 @@
+# 环境变量与本地凭据；配置模板仍可提交
+.env
+.env.*
+!.env.example
+!.env.*.example
+/.aws/
+
+# Python 虚拟环境、缓存与构建产物
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+/build/
+/dist/
+*.egg-info/
+
+# 本地数据、模型权重与运行结果
+/data/
+/models/
+/outputs/
+/runs/
+
+# 本地助手状态与系统临时文件
+/.codex/
+/.agents/
+.DS_Store
+Thumbs.db
