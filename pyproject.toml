@@ -1,0 +1,13 @@
+[project]
+name = "task-3"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "lap>=0.5.13",
+    "openai>=3.37.0",
+    "opencv-python>=5.0.0.93",
+    "python-dotenv>=1.2.4",
+    "ultralytics>=8.4.189",
+]
